@@ -250,7 +250,8 @@ typedef struct {
   int emfile_fd;                                                              \
   UV_PLATFORM_LOOP_FIELDS                                                     \
 
-#define UV_REQ_TYPE_PRIVATE /* empty */
+#define UV_REQ_TYPE_PRIVATE                                                   \
+  UV_STREAM_READ_BY_IOURING,
 
 #define UV_REQ_PRIVATE_FIELDS  /* empty */
 
@@ -292,7 +293,11 @@ typedef struct {
   int delayed_error;                                                          \
   int accepted_fd;                                                            \
   void* queued_fds;                                                           \
+  uv__stream_read_t *stream_read_req_by_iouring;                              \
   UV_STREAM_PRIVATE_PLATFORM_FIELDS                                           \
+  /* stream_read_req_by_iouring is allocated on uv__stream_init() and freed inside uv_close().
+   It is used by uv internally.*/
+
 
 #define UV_TCP_PRIVATE_FIELDS /* empty */
 

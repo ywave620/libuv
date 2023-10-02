@@ -1,0 +1,56 @@
+diff --git a/test/test-list.h b/test/test-list.h
+index 36de006f..de691368 100644
+--- a/test/test-list.h
++++ b/test/test-list.h
+@@ -106,7 +106,7 @@ TEST_DECLARE   (tcp_write_after_connect)
+ TEST_DECLARE   (tcp_writealot)
+ TEST_DECLARE   (tcp_write_fail)
+ TEST_DECLARE   (tcp_try_write)
+-TEST_DECLARE   (tcp_write_in_a_row)
++// TEST_DECLARE   (tcp_write_in_a_row)
+ TEST_DECLARE   (tcp_try_write_error)
+ TEST_DECLARE   (tcp_write_queue_order)
+ TEST_DECLARE   (tcp_open)
+@@ -693,7 +693,7 @@ TASK_LIST_START
+   TEST_HELPER (tcp_write_fail, tcp4_echo_server)
+ 
+   TEST_ENTRY  (tcp_try_write)
+-  TEST_ENTRY  (tcp_write_in_a_row)
++  // TEST_ENTRY  (tcp_write_in_a_row)
+   TEST_ENTRY  (tcp_try_write_error)
+ 
+   TEST_ENTRY  (tcp_write_queue_order)
+diff --git a/test/test-tcp-write-in-a-row.c b/test/test-tcp-write-in-a-row.c
+index 99f4dee1..85eb6146 100644
+--- a/test/test-tcp-write-in-a-row.c
++++ b/test/test-tcp-write-in-a-row.c
+@@ -52,7 +52,7 @@ static void write_cb(uv_write_t* w, int status) {
+   if (write_cb_called == 2) {
+     /* we are done */
+     uv_close((uv_handle_t*) &client, close_cb);
+-    uv_close((uv_handle_t*) &incoming, close_cb);
++    // uv_close((uv_handle_t*) &incoming, close_cb);
+     uv_close((uv_handle_t*) &server, close_cb);
+   }
+ }
+@@ -90,7 +90,9 @@ static void alloc_cb(uv_handle_t* handle, size_t size, uv_buf_t* buf) {
+   buf->len = sizeof(base);
+ }
+ 
+-static void read_cb(uv_stream_t* tcp, ssize_t nread, const uv_buf_t* buf) {}
++static void read_cb(uv_stream_t* tcp, ssize_t nread, const uv_buf_t* buf) {
++  printf("read_cb.nread=%ld\n", nread);
++}
+ 
+ static void connection_cb(uv_stream_t* tcp, int status) {
+   ASSERT_EQ(0, status);
+@@ -111,7 +113,8 @@ static void start_server(void) {
+   ASSERT_EQ(0, uv_listen((uv_stream_t*) &server, 128, connection_cb));
+ }
+ 
+-TEST_IMPL(tcp_write_in_a_row) {
++int main() {
++// TEST_IMPL(tcp_write_in_a_row) {
+ #if defined(_WIN32)
+   RETURN_SKIP("tcp_write_in_a_row does not work on Windows");
+ #else

@@ -424,8 +424,8 @@ struct uv__loop_internal_fields_s {
   uv__loop_metrics_t loop_metrics;
   int current_timeout;
 #ifdef __linux__
-  struct uv__iou ctl;
-  struct uv__iou iou;
+  struct uv__iou ctl; // remark: this ring instance won't be epoll, see uv__platform_loop_init
+  struct uv__iou iou; // net-ring: submit read() and recvmsg() apart from fs operation to this ring and epoll it for completion
   void* inv;  /* used by uv__platform_invalidate_fd() */
 #endif  /* __linux__ */
 };

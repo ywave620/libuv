@@ -60,19 +60,9 @@ struct uv__stream_select_s {
 };
 #endif /* defined(__APPLE__) */
 
-union uv__cmsg {
-  struct cmsghdr hdr;
-  /* This cannot be larger because of the IBMi PASE limitation that
-   * the total size of control messages cannot exceed 256 bytes.
-   */
-  char pad[256];
-};
-
-STATIC_ASSERT(256 == sizeof(union uv__cmsg));
-
 static void uv__stream_connect(uv_stream_t*);
 static void uv__write(uv_stream_t* stream);
-static void uv__read(uv_stream_t* stream);
+void uv__read(uv__stream_read_t *stream_read, ssize_t res);
 static void uv__stream_io(uv_loop_t* loop, uv__io_t* w, unsigned int events);
 static void uv__write_callbacks(uv_stream_t* stream);
 static size_t uv__write_req_size(uv_write_t* req);
@@ -94,6 +84,9 @@ void uv__stream_init(uv_loop_t* loop,
   stream->accepted_fd = -1;
   stream->queued_fds = NULL;
   stream->delayed_error = 0;
+  stream->stream_read_req_by_iouring = (uv__stream_read_t *) malloc(sizeof(uv__stream_read_t));
+  assert(stream->stream_read_req_by_iouring);
+
   uv__queue_init(&stream->write_queue);
   uv__queue_init(&stream->write_completed_queue);
   stream->write_queue_size = 0;
@@ -976,7 +969,9 @@ static int uv__stream_queue_fd(uv_stream_t* stream, int fd) {
   return 0;
 }
 
-
+// uv__stream_recv_cmsg is used to process ancillary data from other threads/processes
+// for node.js, it only gets involved in cluster module
+// net-ring: this function need no adaption when switch to io_uring based networking
 static int uv__stream_recv_cmsg(uv_stream_t* stream, struct msghdr* msg) {
   struct cmsghdr* cmsg;
   int fd;
@@ -1016,141 +1011,106 @@ static int uv__stream_recv_cmsg(uv_stream_t* stream, struct msghdr* msg) {
   return 0;
 }
 
-
-static void uv__read(uv_stream_t* stream) {
-  uv_buf_t buf;
-  ssize_t nread;
-  struct msghdr msg;
-  union uv__cmsg cmsg;
-  int count;
-  int err;
-  int is_ipc;
-
-  stream->flags &= ~UV_HANDLE_READ_PARTIAL;
-
-  /* Prevent loop starvation when the data comes in as fast as (or faster than)
-   * we can read it. XXX Need to rearm fd if we switch to edge-triggered I/O.
-   */
-  count = 32;
-
-  is_ipc = stream->type == UV_NAMED_PIPE && ((uv_pipe_t*) stream)->ipc;
-
+static inline int uv__stream_wants_more_read(uv_stream_t* stream) {
   /* XXX: Maybe instead of having UV_HANDLE_READING we just test if
    * tcp->read_cb is NULL or not?
    */
-  while (stream->read_cb
-      && (stream->flags & UV_HANDLE_READING)
-      && (count-- > 0)) {
-    assert(stream->alloc_cb != NULL);
-
-    buf = uv_buf_init(NULL, 0);
-    stream->alloc_cb((uv_handle_t*)stream, 64 * 1024, &buf);
-    if (buf.base == NULL || buf.len == 0) {
-      /* User indicates it can't or won't handle the read. */
-      stream->read_cb(stream, UV_ENOBUFS, &buf);
-      return;
-    }
-
-    assert(buf.base != NULL);
-    assert(uv__stream_fd(stream) >= 0);
-
-    if (!is_ipc) {
-      do {
-        nread = read(uv__stream_fd(stream), buf.base, buf.len);
-      }
-      while (nread < 0 && errno == EINTR);
-    } else {
-      /* ipc uses recvmsg */
-      msg.msg_flags = 0;
-      msg.msg_iov = (struct iovec*) &buf;
-      msg.msg_iovlen = 1;
-      msg.msg_name = NULL;
-      msg.msg_namelen = 0;
-      /* Set up to receive a descriptor even if one isn't in the message */
-      msg.msg_controllen = sizeof(cmsg);
-      msg.msg_control = &cmsg.hdr;
-
-      do {
-        nread = uv__recvmsg(uv__stream_fd(stream), &msg, 0);
-      }
-      while (nread < 0 && errno == EINTR);
-    }
-
-    if (nread < 0) {
-      /* Error */
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        /* Wait for the next one. */
-        if (stream->flags & UV_HANDLE_READING) {
-          uv__io_start(stream->loop, &stream->io_watcher, POLLIN);
-          uv__stream_osx_interrupt_select(stream);
-        }
-        stream->read_cb(stream, 0, &buf);
-#if defined(__CYGWIN__) || defined(__MSYS__)
-      } else if (errno == ECONNRESET && stream->type == UV_NAMED_PIPE) {
-        uv__stream_eof(stream, &buf);
-        return;
-#endif
-      } else {
-        /* Error. User should call uv_close(). */
-        stream->flags &= ~(UV_HANDLE_READABLE | UV_HANDLE_WRITABLE);
-        stream->read_cb(stream, UV__ERR(errno), &buf);
-        if (stream->flags & UV_HANDLE_READING) {
-          stream->flags &= ~UV_HANDLE_READING;
-          uv__io_stop(stream->loop, &stream->io_watcher, POLLIN);
-          uv__handle_stop(stream);
-          uv__stream_osx_interrupt_select(stream);
-        }
-      }
-      return;
-    } else if (nread == 0) {
-      uv__stream_eof(stream, &buf);
-      return;
-    } else {
-      /* Successful read */
-      ssize_t buflen = buf.len;
-
-      if (is_ipc) {
-        err = uv__stream_recv_cmsg(stream, &msg);
-        if (err != 0) {
-          stream->read_cb(stream, err, &buf);
-          return;
-        }
-      }
-
-#if defined(__MVS__)
-      if (is_ipc && msg.msg_controllen > 0) {
-        uv_buf_t blankbuf;
-        int nread;
-        struct iovec *old;
-
-        blankbuf.base = 0;
-        blankbuf.len = 0;
-        old = msg.msg_iov;
-        msg.msg_iov = (struct iovec*) &blankbuf;
-        nread = 0;
-        do {
-          nread = uv__recvmsg(uv__stream_fd(stream), &msg, 0);
-          err = uv__stream_recv_cmsg(stream, &msg);
-          if (err != 0) {
-            stream->read_cb(stream, err, &buf);
-            msg.msg_iov = old;
-            return;
-          }
-        } while (nread == 0 && msg.msg_controllen > 0);
-        msg.msg_iov = old;
-      }
-#endif
-      stream->read_cb(stream, nread, &buf);
-
-      /* Return if we didn't fill the buffer, there is no more data to read. */
-      if (nread < buflen) {
-        stream->flags |= UV_HANDLE_READ_PARTIAL;
-        return;
-      }
-    }
-  }
+  return uv__stream_fd(stream) > 0 && stream->read_cb && (stream->flags & UV_HANDLE_READING);
 }
 
+// net-ring: before transition to io_uring based networking, this is used to conduct read() or recvmsg() on
+// fd that is ready to read. However, for io_uring based read, this is called in src/unix/linux.c after
+// the read() or recvmsg() are done by the kernel, it procsesses the return value and
+// call user cb.
+// TODO rename to uv__read_done_by_iouring
+// TODO revert change to function in non linux platform
+// TODO this should be placed in src/unix/linux.c, b/c io_uring is linux specific
+void uv__read(uv__stream_read_t* stream_read, ssize_t nread /* got from io_uring, so errcode is stored as negative*/) {
+  uv_stream_t* stream = stream_read->stream;
+  uv_buf_t buf = stream_read->read_buf;
+  int err;
+
+  // net-ring: review the flags handling logic
+  stream->flags &= ~UV_HANDLE_READ_PARTIAL;
+
+  if (!uv__stream_wants_more_read(stream)) {
+    return; /* user call uv_read_start() and cancel it(through uv_read_stop()) before we fire the callback*/
+  }
+
+  int is_ipc = stream->type == UV_NAMED_PIPE && ((uv_pipe_t*)stream)->ipc;
+
+  assert(stream->alloc_cb != NULL);
+
+  // net-ring: move this invocation of alloc_cb to elsewhere
+
+  // net-ring: remove the following if and else block
+  // these two syscall are submitted to io_uring in uv__read_start
+  // in the first time and then re-submitted in this function later
+
+  if (nread < 0) {
+    assert(nread != EAGAIN && nread != EWOULDBLOCK);
+    /* Error. User should call uv_close(). */
+    stream->flags &= ~(UV_HANDLE_READABLE | UV_HANDLE_WRITABLE);
+    stream->read_cb(stream, nread, &buf);
+    if (stream->flags & UV_HANDLE_READING) {
+      stream->flags &= ~UV_HANDLE_READING;
+      uv__handle_stop(stream);
+      // net-ring: remove this, `stream`, a connected socket should have not been epoll
+    }
+    return;
+  }
+
+  if (nread == 0) {
+    uv__stream_eof(stream, &buf);
+    return;
+  }
+
+  /* Successful read */
+  ssize_t buflen = buf.len;
+
+  if (is_ipc) {
+    err = uv__stream_recv_cmsg(stream, &stream_read->msg);
+    if (err != 0) {
+      stream->read_cb(stream, err, &buf);
+      return;
+    }
+  }
+
+#if defined(__MVS__)
+  if (is_ipc && msg.msg_controllen > 0) {
+    uv_buf_t blankbuf;
+    int nread;
+    struct iovec *old;
+
+    blankbuf.base = 0;
+    blankbuf.len = 0;
+    old = msg.msg_iov;
+    msg.msg_iov = (struct iovec*) &blankbuf;
+    nread = 0;
+    do {
+      nread = uv__recvmsg(uv__stream_fd(stream), &msg, 0);
+      err = uv__stream_recv_cmsg(stream, &msg);
+      if (err != 0) {
+        stream->read_cb(stream, err, &buf);
+        msg.msg_iov = old;
+        return;
+      }
+    } while (nread == 0 && msg.msg_controllen > 0);
+    msg.msg_iov = old;
+  }
+#endif
+  stream->read_cb(stream, nread, &buf);
+
+  /* Return if we didn't fill the buffer, there is no more data to read. */
+  if (nread < buflen) {
+    stream->flags |= UV_HANDLE_READ_PARTIAL;
+    return;
+  }
+
+  if (uv__stream_wants_more_read(stream)) {
+    assert(uv__iou_stream_read(stream));  // TODO: how to handle this error
+  }
+}
 
 int uv_shutdown(uv_shutdown_t* req, uv_stream_t* stream, uv_shutdown_cb cb) {
   assert(stream->type == UV_TCP ||
@@ -1198,29 +1158,8 @@ static void uv__stream_io(uv_loop_t* loop, uv__io_t* w, unsigned int events) {
 
   assert(uv__stream_fd(stream) >= 0);
 
-  /* Ignore POLLHUP here. Even if it's set, there may still be data to read. */
-  if (events & (POLLIN | POLLERR | POLLHUP))
-    uv__read(stream);
-
-  if (uv__stream_fd(stream) == -1)
-    return;  /* read_cb closed stream. */
-
-  /* Short-circuit iff POLLHUP is set, the user is still interested in read
-   * events and uv__read() reported a partial read but not EOF. If the EOF
-   * flag is set, uv__read() called read_cb with err=UV_EOF and we don't
-   * have to do anything. If the partial read flag is not set, we can't
-   * report the EOF yet because there is still data to read.
-   */
-  if ((events & POLLHUP) &&
-      (stream->flags & UV_HANDLE_READING) &&
-      (stream->flags & UV_HANDLE_READ_PARTIAL) &&
-      !(stream->flags & UV_HANDLE_READ_EOF)) {
-    uv_buf_t buf = { NULL, 0 };
-    uv__stream_eof(stream, &buf);
-  }
-
-  if (uv__stream_fd(stream) == -1)
-    return;  /* read_cb closed stream. */
+  // net-ring: we no longer epoll for read, uv__read is called when reaping a CQ
+  assert(!(events & POLLIN));
 
   if (events & (POLLOUT | POLLERR | POLLHUP)) {
     uv__write(stream);
@@ -1430,7 +1369,7 @@ int uv_try_write2(uv_stream_t* stream,
   return uv__try_write(stream, bufs, nbufs, send_handle);
 }
 
-
+// uv__read_start return non-zero upon error
 int uv__read_start(uv_stream_t* stream,
                    uv_alloc_cb alloc_cb,
                    uv_read_cb read_cb) {
@@ -1446,12 +1385,11 @@ int uv__read_start(uv_stream_t* stream,
   assert(uv__stream_fd(stream) >= 0);
   assert(alloc_cb);
 
-  stream->read_cb = read_cb;
+  stream->read_cb = read_cb; // remark: read-cb can be null
   stream->alloc_cb = alloc_cb;
 
-  uv__io_start(stream->loop, &stream->io_watcher, POLLIN);
   uv__handle_start(stream);
-  uv__stream_osx_interrupt_select(stream);
+  assert (uv__iou_stream_read(stream)); // net-ring: TODO handle error
 
   return 0;
 }
@@ -1462,9 +1400,8 @@ int uv_read_stop(uv_stream_t* stream) {
     return 0;
 
   stream->flags &= ~UV_HANDLE_READING;
-  uv__io_stop(stream->loop, &stream->io_watcher, POLLIN);
   uv__handle_stop(stream);
-  uv__stream_osx_interrupt_select(stream);
+  // net-ring: no epoll has been registerd for `stream`, so nothing to unregister here
 
   stream->read_cb = NULL;
   stream->alloc_cb = NULL;

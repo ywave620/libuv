@@ -58,12 +58,24 @@ extern "C" {
 #include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 /* Internal type, do not use. */
 struct uv__queue {
   struct uv__queue* next;
   struct uv__queue* prev;
 };
+
+union uv__cmsg {
+  struct cmsghdr hdr;
+  /* This cannot be larger because of the IBMi PASE limitation that
+   * the total size of control messages cannot exceed 256 bytes.
+   */
+  char pad[256];
+};
+
+// TODO enable and fix this
+// STATIC_ASSERT(256 == sizeof(union uv__cmsg));
 
 #if defined(_WIN32)
 # include "uv/win.h"
@@ -440,6 +452,19 @@ UV_EXTERN char* uv_err_name_r(int err, char* buf, size_t buflen);
 struct uv_req_s {
   UV_REQ_FIELDS
 };
+
+/*
+ * uv__stream_read_t is a subclass of uv_req_t, used internally by uv
+ */
+typedef struct {
+  /* net-ring: actually, we only want the `type` in UV_REQ_FIELDS, which is initilizad to UV_STREAM_READ_BY_IOURING*/
+  UV_REQ_FIELDS
+  uv_stream_t *stream;
+  // TODO: these two fields are used in IPC, which is not a hot case, allocate space for them on-demand
+  struct msghdr msg;
+  uv_buf_t read_buf;
+  union uv__cmsg cmsg;
+} uv__stream_read_t;
 
 
 /* Platform-specific request types. */

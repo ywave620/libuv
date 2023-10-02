@@ -153,15 +153,17 @@ enum {
   UV__IORING_OP_READV = 1,
   UV__IORING_OP_WRITEV = 2,
   UV__IORING_OP_FSYNC = 3,
+  UV__IORING_OP_RECVMSG = 10,
   UV__IORING_OP_OPENAT = 18,
   UV__IORING_OP_CLOSE = 19,
   UV__IORING_OP_STATX = 21,
+  UV__IORING_OP_READ = 22,
   UV__IORING_OP_EPOLL_CTL = 29,
   UV__IORING_OP_RENAMEAT = 35,
   UV__IORING_OP_UNLINKAT = 36,
   UV__IORING_OP_MKDIRAT = 37,
   UV__IORING_OP_SYMLINKAT = 38,
-  UV__IORING_OP_LINKAT = 39,
+  UV__IORING_OP_LINKAT = 39
 };
 
 enum {
@@ -572,6 +574,8 @@ static void uv__iou_init(int epollfd,
   if (sq == MAP_FAILED || sqe == MAP_FAILED)
     goto fail;
 
+  // remark: We want to get notificated whenever a completion
+  // is pushed to CQ by kernel, so we add `ringfd` to the watched list of `epollfd`
   if (flags & UV__IORING_SETUP_SQPOLL) {
     /* Only interested in completion events. To get notified when
      * the kernel pulls items from the submission ring, add POLLOUT.
@@ -612,6 +616,8 @@ static void uv__iou_init(int epollfd,
   return;
 
 fail:
+  printf("uv__iou_init fail: some io_uring features are not supported in the current kernel\n");
+  abort();
   if (sq != MAP_FAILED)
     munmap(sq, maxlen);
 
@@ -646,8 +652,8 @@ int uv__platform_loop_init(uv_loop_t* loop) {
   if (loop->backend_fd == -1)
     return UV__ERR(errno);
 
-  uv__iou_init(loop->backend_fd, &lfields->iou, 64, UV__IORING_SETUP_SQPOLL);
-  uv__iou_init(loop->backend_fd, &lfields->ctl, 256, 0);
+  uv__iou_init(loop->backend_fd, &lfields->iou, 256/*net-poll tune this*/, UV__IORING_SETUP_SQPOLL);
+  // uv__iou_init(loop->backend_fd, &lfields->ctl, 256, 0); disable batching epoll_ctl through io_uring
 
   return 0;
 }
@@ -754,11 +760,9 @@ int uv__io_check_fd(uv_loop_t* loop, int fd) {
   return rc;
 }
 
-
 /* Caller must initialize SQE and call uv__iou_submit(). */
 static struct uv__io_uring_sqe* uv__iou_get_sqe(struct uv__iou* iou,
-                                                uv_loop_t* loop,
-                                                uv_fs_t* req) {
+                                                uv_req_t* req) {
   struct uv__io_uring_sqe* sqe;
   uint32_t head;
   uint32_t tail;
@@ -782,6 +786,19 @@ static struct uv__io_uring_sqe* uv__iou_get_sqe(struct uv__iou* iou,
   memset(sqe, 0, sizeof(*sqe));
   sqe->user_data = (uintptr_t) req;
 
+  iou->in_flight++;
+
+  return sqe;
+}
+
+/* Caller must initialize SQE and call uv__iou_submit(). */
+static struct uv__io_uring_sqe* uv__iou_get_sqe_for_fs_req(struct uv__iou* iou,
+                                                uv_loop_t* loop,
+                                                uv_fs_t* req) {
+  struct uv__io_uring_sqe* sqe = uv__iou_get_sqe(iou, (uv_req_t*) req);
+  if (sqe == NULL)
+    return NULL;
+
   /* Pacify uv_cancel(). */
   req->work_req.loop = loop;
   req->work_req.work = NULL;
@@ -789,7 +806,6 @@ static struct uv__io_uring_sqe* uv__iou_get_sqe(struct uv__iou* iou,
   uv__queue_init(&req->work_req.wq);
 
   uv__req_register(loop, req);
-  iou->in_flight++;
 
   return sqe;
 }
@@ -809,6 +825,83 @@ static void uv__iou_submit(struct uv__iou* iou) {
     if (uv__io_uring_enter(iou->ringfd, 0, 0, UV__IORING_ENTER_SQ_WAKEUP))
       if (errno != EOWNERDEAD)  /* Kernel bug. Harmless, ignore. */
         perror("libuv: io_uring_enter(wakeup)");  /* Can't happen. */
+
+  // net-ring: disable SQ_POLL and call io_uring_enter to submit proactively?
+  // strategy 1: submit here if iou->in_flight becomes too large or submit in `,
+  //              that is right after epoll_pwait
+  // strategy 2: submit here blindly
+}
+
+/* stolen from liburing and pruned for our purpose */
+static inline void uv__iou_init_rw_sqe(int op,
+                                       struct uv__io_uring_sqe* sqe /* must be returned from uv__iou_get_sqe()*/,
+                                       int fd,
+                                       const void* addr, unsigned len,
+                                       uint64_t offset) {
+  sqe->opcode = (__u8)op;
+  sqe->flags = 0;
+  sqe->ioprio = 0;
+  sqe->fd = fd;
+  sqe->off = offset;
+  sqe->addr = (unsigned long)addr;
+  sqe->len = len;
+  sqe->rw_flags = 0;
+  sqe->buf_index = 0;
+}
+
+// called by uv__read_start() or after io_uring tells us a read is done and user wants more read
+// return 0 if error
+int uv__iou_stream_read(uv_stream_t* stream) {
+  uv_buf_t *buf = &(stream->stream_read_req_by_iouring->read_buf);
+  *buf = uv_buf_init(NULL, 0);
+
+  stream->alloc_cb((uv_handle_t*)stream, 64 * 1024, buf);
+  if (buf->base == NULL || buf->len == 0) {
+    /* User indicates it can't or won't handle the read. */
+    stream->read_cb(stream, UV_ENOBUFS, buf);
+    return 0;
+  }
+
+  assert(buf->base != NULL);
+  assert(uv__stream_fd(stream) >= 0);
+
+  stream->stream_read_req_by_iouring->stream = stream;
+  stream->stream_read_req_by_iouring->type = UV_STREAM_READ_BY_IOURING;
+
+  struct uv__iou *iou = &uv__get_internal_fields(stream->loop)->iou;
+  struct uv__io_uring_sqe* sqe = uv__iou_get_sqe(iou, (uv_req_t*) (stream->stream_read_req_by_iouring));
+  if (sqe == NULL)
+    return 0;
+
+  int is_ipc = stream->type == UV_NAMED_PIPE && ((uv_pipe_t*) stream)->ipc;
+  /**
+   * This function submits syscall that would be done in uv__read() if we were not using io_uring
+   * i.e. read() or recvmsg()
+   */
+  if (is_ipc) {
+    /* ipc uses recvmsg see the original uv__read() and uv__recvmsg() for
+    how to construct these objects*/
+    struct msghdr* msg = &(stream->stream_read_req_by_iouring->msg);
+    union uv__cmsg* cmsg = &(stream->stream_read_req_by_iouring->cmsg);
+
+    msg->msg_flags = 0;
+    msg->msg_iov = (struct iovec*)&buf;
+    msg->msg_iovlen = 1;
+    msg->msg_name = NULL;
+    msg->msg_namelen = 0;
+    /* Set up to receive a descriptor even if one isn't in the message */
+    msg->msg_controllen = sizeof(*cmsg);
+    msg->msg_control = &(cmsg->hdr);
+    msg->msg_flags = 0 | MSG_CMSG_CLOEXEC;
+
+    uv__iou_init_rw_sqe(UV__IORING_OP_RECVMSG, sqe, uv__stream_fd(stream), msg, 1 /* length */, 0 /* offset */);
+  } else {
+    uv__iou_init_rw_sqe(UV__IORING_OP_READ, sqe, uv__stream_fd(stream), (void*) buf->base, buf->len, 0 /* offset */);
+  }
+
+  uv__iou_submit(iou);
+
+  return 1;
 }
 
 
@@ -838,7 +931,7 @@ int uv__iou_fs_close(uv_loop_t* loop, uv_fs_t* req) {
 
   iou = &uv__get_internal_fields(loop)->iou;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL)
     return 0;
 
@@ -859,7 +952,7 @@ int uv__iou_fs_fsync_or_fdatasync(uv_loop_t* loop,
 
   iou = &uv__get_internal_fields(loop)->iou;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL)
     return 0;
 
@@ -885,7 +978,7 @@ int uv__iou_fs_link(uv_loop_t* loop, uv_fs_t* req) {
   if (!(iou->flags & UV__MKDIRAT_SYMLINKAT_LINKAT))
     return 0;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL)
     return 0;
 
@@ -910,7 +1003,7 @@ int uv__iou_fs_mkdir(uv_loop_t* loop, uv_fs_t* req) {
   if (!(iou->flags & UV__MKDIRAT_SYMLINKAT_LINKAT))
     return 0;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL)
     return 0;
 
@@ -931,7 +1024,7 @@ int uv__iou_fs_open(uv_loop_t* loop, uv_fs_t* req) {
 
   iou = &uv__get_internal_fields(loop)->iou;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL)
     return 0;
 
@@ -953,7 +1046,7 @@ int uv__iou_fs_rename(uv_loop_t* loop, uv_fs_t* req) {
 
   iou = &uv__get_internal_fields(loop)->iou;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL)
     return 0;
 
@@ -978,7 +1071,7 @@ int uv__iou_fs_symlink(uv_loop_t* loop, uv_fs_t* req) {
   if (!(iou->flags & UV__MKDIRAT_SYMLINKAT_LINKAT))
     return 0;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL)
     return 0;
 
@@ -999,7 +1092,7 @@ int uv__iou_fs_unlink(uv_loop_t* loop, uv_fs_t* req) {
 
   iou = &uv__get_internal_fields(loop)->iou;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL)
     return 0;
 
@@ -1030,7 +1123,7 @@ int uv__iou_fs_read_or_write(uv_loop_t* loop,
 
   iou = &uv__get_internal_fields(loop)->iou;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL)
     return 0;
 
@@ -1060,7 +1153,7 @@ int uv__iou_fs_statx(uv_loop_t* loop,
 
   iou = &uv__get_internal_fields(loop)->iou;
 
-  sqe = uv__iou_get_sqe(iou, loop, req);
+  sqe = uv__iou_get_sqe_for_fs_req(iou, loop, req);
   if (sqe == NULL) {
     uv__free(statxbuf);
     return 0;
@@ -1130,11 +1223,11 @@ static void uv__iou_fs_statx_post(uv_fs_t* req) {
   uv__free(statxbuf);
 }
 
-
-static void uv__poll_io_uring(uv_loop_t* loop, struct uv__iou* iou) {
+// net-ring: this function is called when epoll_pwait tell us `iou` has CQ to reap.
+static void uv__poll_io_uring(uv_loop_t* loop, struct uv__iou* iou /* uv__loop_internal_fields_s.iou */) {
   struct uv__io_uring_cqe* cqe;
   struct uv__io_uring_cqe* e;
-  uv_fs_t* req;
+  uv_req_t* req;
   uint32_t head;
   uint32_t tail;
   uint32_t mask;
@@ -1152,28 +1245,41 @@ static void uv__poll_io_uring(uv_loop_t* loop, struct uv__iou* iou) {
 
   for (i = head; i != tail; i++) {
     e = &cqe[i & mask];
+    req = (uv_req_t*) (uintptr_t) e->user_data;
 
-    req = (uv_fs_t*) (uintptr_t) e->user_data;
-    assert(req->type == UV_FS);
-
-    uv__req_unregister(loop, req);
     iou->in_flight--;
+    // printf("CQ head=%d CQ tail=%d CQE idx=%d CQE type=%d iou->in_flight=%d CQE res=%d\n", head, tail, i, req->type, iou->in_flight, e->res);
+    assert (e->res != -EINTR && e->res != -EWOULDBLOCK && e->res != -EAGAIN);
 
-    /* io_uring stores error codes as negative numbers, same as libuv. */
-    req->result = e->res;
+    switch (req->type) {
+    case UV_FS:
+      uv_fs_t *fs_req = (uv_fs_t*) req;
+      uv__req_unregister(loop, req);
 
-    switch (req->fs_type) {
-      case UV_FS_FSTAT:
-      case UV_FS_LSTAT:
-      case UV_FS_STAT:
-        uv__iou_fs_statx_post(req);
+      /* io_uring stores error codes as negative numbers, same as libuv. */
+      fs_req->result = e->res;
+
+      switch (fs_req->fs_type) {
+        case UV_FS_FSTAT:
+        case UV_FS_LSTAT:
+        case UV_FS_STAT:
+          uv__iou_fs_statx_post(fs_req);
+          break;
+        default:  /* Squelch -Wswitch warnings. */
+          break;
+      }
+
+      uv__metrics_update_idle_time(loop);
+      fs_req->cb(fs_req);
+      break;
+    case UV_STREAM_READ_BY_IOURING:
+        /* net-ring: call uv__metrics_update_idle_time() ?*/
+        uv__read((uv__stream_read_t*) req, e->res);
         break;
-      default:  /* Squelch -Wswitch warnings. */
-        break;
+
+    default:
+      abort();
     }
-
-    uv__metrics_update_idle_time(loop);
-    req->cb(req);
     nevents++;
   }
 
@@ -1254,9 +1360,9 @@ static void uv__epoll_ctl_prep(int epollfd,
   }
 }
 
-
+// remark: uv__epoll_ctl_flush flush all epoll_ctl operation added to `ctl` sychroniously
 static void uv__epoll_ctl_flush(int epollfd,
-                                struct uv__iou* ctl,
+                                struct uv__iou* ctl, /* uv__loop_internal_fields_s->ctl*/
                                 struct epoll_event (*events)[256]) {
   struct epoll_event oldevents[256];
   struct uv__io_uring_cqe* cqe;
@@ -1443,7 +1549,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
         timeout = user_timeout;
         reset_timeout = 0;
       } else if (nfds == 0) {
-        return;
+        return; // bug?: should be break
       }
 
       /* Interrupted by a signal. Update timeout and poll again. */
@@ -1466,8 +1572,9 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
         continue;
 
       if (fd == iou->ringfd) {
-        uv__poll_io_uring(loop, iou);
+        uv__poll_io_uring(loop, iou); // net-ring: retain this
         have_iou_events = 1;
+        nevents ++;
         continue;
       }
 
@@ -1516,6 +1623,8 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
         /* Run signal watchers last.  This also affects child process watchers
          * because those are implemented in terms of signal watchers.
          */
+        // remark: signal_io_watcher is not designed to activiate in response
+        // to a signal, despite its name :((
         if (w == &loop->signal_io_watcher) {
           have_signals = 1;
         } else {
@@ -1556,6 +1665,9 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
       break;
     }
 
+    // the above if implies that if no event is reaped in this iteration
+    // then poll again
+
 update_timeout:
     if (timeout == 0)
       break;
@@ -1570,9 +1682,9 @@ update_timeout:
       break;
 
     timeout = real_timeout;
-  }
+  } // the polling loop
 
-  if (ctl->ringfd != -1)
+  if (ctl->ringfd != -1) // net-ring: retain this
     while (*ctl->sqhead != *ctl->sqtail)
       uv__epoll_ctl_flush(epollfd, ctl, &prep);
 }

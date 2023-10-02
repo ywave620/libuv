@@ -1,0 +1,32 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "(gdb) Launch",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/data/home/rogertyang/libuv/test/test-tcp-write-in-a-row",
+      "args": ["tcp_write_in_a_row"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        {
+          "name": "UV_RUN_AS_ROOT",
+          "value": "1"
+        },
+        {
+          "name": "UV_TEST_TIMEOUT_MULTIPLIER",
+          "value": "10"
+        }
+      ],
+      "setupCommands": [
+        {"text": "-gdb-set follow-fork-mode child"}
+      ],
+      "externalConsole": false,
+      "MIMode": "gdb",
+    }
+  ]
+}

@@ -348,6 +348,11 @@ int uv__iou_fs_statx(uv_loop_t* loop,
                      int is_lstat);
 int uv__iou_fs_symlink(uv_loop_t* loop, uv_fs_t* req);
 int uv__iou_fs_unlink(uv_loop_t* loop, uv_fs_t* req);
+int uv__iou_stream_read(uv_stream_t* stream);
+/* net-poll: unlike other functions, this one is defined in src/unix/stream.c
+ * b.c we impl it by making change to uv__read()
+ */
+void uv__read(uv__stream_read_t* stream_read, ssize_t nread);
 #else
 #define uv__iou_fs_close(loop, req) 0
 #define uv__iou_fs_fsync_or_fdatasync(loop, req, fsync_flags) 0
@@ -359,6 +364,7 @@ int uv__iou_fs_unlink(uv_loop_t* loop, uv_fs_t* req);
 #define uv__iou_fs_statx(loop, req, is_fstat, is_lstat) 0
 #define uv__iou_fs_symlink(loop, req) 0
 #define uv__iou_fs_unlink(loop, req) 0
+#define uv__iou_stream_read(stream) 0
 #endif
 
 #if defined(__APPLE__)
