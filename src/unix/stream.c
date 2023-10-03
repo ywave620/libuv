@@ -1048,10 +1048,14 @@ void uv__read(uv__stream_read_t* stream_read, ssize_t nread /* got from io_uring
   // in the first time and then re-submitted in this function later
 
   if (nread < 0) {
-    assert(nread != EAGAIN && nread != EWOULDBLOCK);
+    assert(nread != -EAGAIN && nread != -EWOULDBLOCK);
+
+    // TODO: repost this read and return
+    assert (nread != -EINTR);
+
     /* Error. User should call uv_close(). */
     stream->flags &= ~(UV_HANDLE_READABLE | UV_HANDLE_WRITABLE);
-    stream->read_cb(stream, nread, &buf);
+    stream->read_cb(stream, nread /* a negative errcode */, &buf);
     if (stream->flags & UV_HANDLE_READING) {
       stream->flags &= ~UV_HANDLE_READING;
       uv__handle_stop(stream);

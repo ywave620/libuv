@@ -652,8 +652,10 @@ int uv__platform_loop_init(uv_loop_t* loop) {
   if (loop->backend_fd == -1)
     return UV__ERR(errno);
 
-  uv__iou_init(loop->backend_fd, &lfields->iou, 256/*net-poll tune this*/, UV__IORING_SETUP_SQPOLL);
-  // uv__iou_init(loop->backend_fd, &lfields->ctl, 256, 0); disable batching epoll_ctl through io_uring
+  uv__iou_init(loop->backend_fd, &lfields->iou, 256/*net-poll tune this*/, 0 /* no SQ_POLL, submit every time we push one to SQ*/);
+
+  // disable batching epoll_ctl through io_uring to tune down variety
+  // uv__iou_init(loop->backend_fd, &lfields->ctl, 256, 0);
 
   return 0;
 }
@@ -821,10 +823,15 @@ static void uv__iou_submit(struct uv__iou* iou) {
   flags = atomic_load_explicit((_Atomic uint32_t*) iou->sqflags,
                                memory_order_acquire);
 
-  if (flags & UV__IORING_SQ_NEED_WAKEUP)
-    if (uv__io_uring_enter(iou->ringfd, 0, 0, UV__IORING_ENTER_SQ_WAKEUP))
-      if (errno != EOWNERDEAD)  /* Kernel bug. Harmless, ignore. */
-        perror("libuv: io_uring_enter(wakeup)");  /* Can't happen. */
+  assert(!(flags & UV__IORING_SQ_NEED_WAKEUP));
+  int r = uv__io_uring_enter(iou->ringfd, 1/* to_submit=1, we submit every time we push one to SQ*/,
+                            0, 0);
+  assert (r == 1);
+
+  // if (flags & UV__IORING_SQ_NEED_WAKEUP)
+  //   if (uv__io_uring_enter(iou->ringfd, 0, 0, UV__IORING_ENTER_SQ_WAKEUP))
+  //     if (errno != EOWNERDEAD)  /* Kernel bug. Harmless, ignore. */
+  //       perror("libuv: io_uring_enter(wakeup)");  /* Can't happen. */
 
   // net-ring: disable SQ_POLL and call io_uring_enter to submit proactively?
   // strategy 1: submit here if iou->in_flight becomes too large or submit in `,
@@ -1249,7 +1256,9 @@ static void uv__poll_io_uring(uv_loop_t* loop, struct uv__iou* iou /* uv__loop_i
 
     iou->in_flight--;
     // printf("CQ head=%d CQ tail=%d CQE idx=%d CQE type=%d iou->in_flight=%d CQE res=%d\n", head, tail, i, req->type, iou->in_flight, e->res);
-    assert (e->res != -EINTR && e->res != -EWOULDBLOCK && e->res != -EAGAIN);
+    // e->res might be -EINTR
+    assert (e->res != -EWOULDBLOCK);
+    assert (e->res != -EAGAIN);
 
     switch (req->type) {
     case UV_FS:
