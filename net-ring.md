@@ -2,30 +2,6 @@
 
 ## windfall
 
-bug in src/unix/linux.c uv__io_poll()
-
-```c
-      if (fd == iou->ringfd) {
-        uv__poll_io_uring(loop, iou);
-        have_iou_events = 1;
-        nevents ++; // missing this increment, an accounting bug, unharmful
-        continue;
-      }
-```
-
-```c
-    if (nfds == 0 || nfds == -1) {
-      if (reset_timeout != 0) {
-        timeout = user_timeout;
-        reset_timeout = 0;
-      } else if (nfds == 0) {
-        return; // bug?: should be break
-      }
-
-      /* Interrupted by a signal. Update timeout and poll again. */
-      goto update_timeout;
-    }
-```
 
 
 ## src notes
