@@ -116,7 +116,7 @@ static void connect_cb(uv_connect_t* req, int status) {
   int i, j, r;
 
   ASSERT(req == &connect_req);
-  ASSERT(status == 0);
+  ASSERT_EQ(status, 0);
 
   stream = req->handle;
   connect_cb_called++;

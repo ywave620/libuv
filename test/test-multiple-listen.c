@@ -57,10 +57,10 @@ static void start_server(void) {
   ASSERT(r == 0);
 
   r = uv_listen((uv_stream_t*)&server, 128, connection_cb);
-  ASSERT(r == 0);
+  ASSERT_EQ(r, 0);
 
   r = uv_listen((uv_stream_t*)&server, 128, connection_cb);
-  ASSERT(r == 0);
+  ASSERT_EQ(r, 0);
 }
 
 

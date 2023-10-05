@@ -49,7 +49,7 @@ static size_t bytes_read;
 static void write_cb(uv_write_t* req, int status) {
   struct write_info* write_info =
       container_of(req, struct write_info, write_req);
-  ASSERT(status == 0);
+  ASSERT_EQ(status, 0);
   bytes_written += BUFFERS_PER_WRITE * BUFFER_SIZE;
   free(write_info);
 }
